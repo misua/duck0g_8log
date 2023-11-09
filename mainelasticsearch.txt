@@ -1,0 +1,152 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/elastic/libkibana/client"
+	"github.com/go-redis/redis/v8"
+)
+
+const (
+	defaultRateLimit = 10                                        // Default rate limit per IP address per minute
+	rateLimitTTL     = 60 * time.Second                          // Rate limit expiration time
+	kibanaURL        = "http://localhost:5044/api/elasticsearch" // Kibana URL
+)
+
+type rateLimiter struct {
+	sync.Mutex
+	redisClient  *redis.Client
+	kibanaClient *client.Client
+	rateLimit    map[string]int
+}
+
+func newRateLimiter(redisClient *redis.Client) *rateLimiter {
+	return &rateLimiter{
+		redisClient:  redisClient,
+		kibanaClient: client.New(kibanaURL),
+		rateLimit:    make(map[string]int),
+	}
+}
+
+func (rl *rateLimiter) checkAndConsumeRequest(ip string) bool {
+	rl.Lock()
+	defer rl.Unlock()
+
+	// Check if the request count for the IP address exceeds the rate limit
+	requestCount, err := rl.redisClient.Get(fmt.Sprintf("ip_requests:%s", ip)).Int()
+	if err != nil && err != redis.Nil {
+		fmt.Printf("Error checking request count for IP %s: %v\n", ip, err)
+		return false
+	}
+
+	if requestCount >= defaultRateLimit {
+		fmt.Printf("Request from IP %s exceeded rate limit\n", ip)
+		return false
+	}
+
+	// Increment the request count for the IP address
+	err = rl.redisClient.Incr(fmt.Sprintf("ip_requests:%s", ip)).Err()
+	if err != nil {
+		fmt.Printf("Error incrementing request count for IP %s: %v\n", ip, err)
+		return false
+	}
+
+	// Set the expiration time for the request count
+	err = rl.redisClient.Expire(fmt.Sprintf("ip_requests:%s", ip), rateLimitTTL).Err()
+	if err != nil {
+		fmt.Printf("Error setting expiration for request count for IP %s: %v\n", ip, err)
+		return false
+	}
+
+	return true
+}
+
+func (rl *rateLimiter) updateRateLimit(ip string, newRateLimit int) error {
+	rl.Lock()
+	defer rl.Unlock()
+
+	// Update the rate limit for the IP address
+	rl.rateLimit[ip] = newRateLimit
+	fmt.Printf("Rate limit updated to %d for IP %s\n", newRateLimit, ip)
+
+	return nil
+}
+
+func handleDataRequest(rl *rateLimiter, w http.ResponseWriter, r *http.Request) {
+	ip := r.RemoteAddr
+
+	// Check if the request exceeds the rate limit
+	if !rl.checkAndConsumeRequest(ip) {
+		http.Error(w, "Too many requests from your IP address. Please try again later.", http.StatusTooManyRequests)
+		return
+	}
+
+	// Process the data request and return the response
+	fmt.Fprintf(w, "Data response for IP address: %s", ip)
+
+	// Send a log entry to Kibana
+	event := map[string]interface{}{
+		"message":   fmt.Sprintf("Data request processed for IP %s", ip),
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+
+	_, err := rl.kibanaClient.Index("rate-limiter-logs", event)
+	if err != nil {
+		fmt.Printf("Error sending log entry to Kibana: %v\n", err)
+	}
+}
+
+func handleRateLimitRequest(rl *rateLimiter, w http.ResponseWriter, r *http.Request) {
+	ip := r.RemoteAddr
+	newRateLimit := r.URL.Query().Get("rate_limit")
+
+	// Convert newRateLimit to integer
+	if newRateLimit == "" {
+		http.Error(w, "Missing rate limit value", http.StatusBadRequest)
+		return
+	}
+
+	newRateLimitInt, err := strconv.Atoi(newRateLimit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "rate limit update to %d for IP %s", newRateLimitInt, ip)
+}
+
+func main() {
+	// Initialize Redis client
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	// Initialize Kibana client
+	kibanaClient, err := client.New(kibanaURL)
+	if err != nil {
+		log.Fatal("Error initializing Kibana client:", err)
+	}
+
+	// Create rate limiter
+	rateLimiter := newRateLimiter(redisClient)
+
+	// Define HTTP routes
+	http.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
+		handleDataRequest(rateLimiter, w, r)
+	})
+
+	http.HandleFunc("/data/rate_limit", func(w http.ResponseWriter, r *http.Request) {
+		handleRateLimitRequest(rateLimiter, w, r)
+	})
+
+	// Start the HTTP server
+	fmt.Println("Starting HTTP server on port 8080")
+	err = http.ListenAndServe(":8080", nil)
+	if err != nil {
+		panic(err)
+	}
+}
