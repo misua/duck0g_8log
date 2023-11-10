@@ -2,158 +2,97 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
-	"strconv"
-	"sync"
 	"time"
 
-	"log"
-
-	"github.com/go-redis/redis/v8"
-	"github.com/grafana/loki/pkg/client/simpleclient"
+	"github.com/gin-gonic/gin"
 )
 
-const (
-	defaultRateLimit = 10                                       // Default rate limit per IP address per minute
-	rateLimitTTL     = 60 * time.Second                         // Rate limit expiration time
-	lokiURL          = "http://localhost:3100/loki/api/v1/push" // Loki URL
-)
+var requestTimestamps = make(map[string]map[string]interface{})
+var defaultLimit = 2
+var defaultWindow = 60
 
-type rateLimiter struct {
-	sync.Mutex
-	redisClient *redis.Client
-	lokiClient  simpleclient.Client
-	rateLimit   map[string]int
-}
+func isRateLimited(ipAddress string, limit int, window int) bool {
+	currentTime := time.Now()
 
-func newRateLimiter(redisClient *redis.Client, lokiClient simpleclient.Client) *rateLimiter {
-	return &rateLimiter{
-		redisClient: redisClient,
-		lokiClient:  lokiClient,
-		rateLimit:   make(map[string]int),
-	}
-}
-
-func (rl *rateLimiter) checkAndConsumeRequest(ip string) bool {
-	rl.Lock()
-	defer rl.Unlock()
-
-	// Check if the request count for the IP address exceeds the rate limit
-	requestCount, err := rl.redisClient.Get(fmt.Sprintf("ip_requests:%s", ip)).Int()
-	if err != nil && err != redis.Nil {
-		log.Printf("Error checking request count for IP %s: %v", ip, err)
+	if _, ok := requestTimestamps[ipAddress]; !ok {
+		requestTimestamps[ipAddress] = make(map[string]interface{})
+		requestTimestamps[ipAddress]["timestamps"] = []time.Time{}
 		return false
 	}
 
-	if requestCount >= defaultRateLimit {
-		log.Printf("Request from IP %s exceeded rate limit", ip)
-		return false
-	}
+	if timestamps, ok := requestTimestamps[ipAddress]["timestamps"].([]time.Time); ok {
+		// Remove timestamps that are outside the time window
+		var newTimestamps []time.Time
+		for _, t := range timestamps {
+			if currentTime.Sub(t) <= time.Second*time.Duration(window) {
+				newTimestamps = append(newTimestamps, t)
+			}
+		}
+		requestTimestamps[ipAddress]["timestamps"] = newTimestamps
 
-	// Increment the request count for the IP address
-	err = rl.redisClient.Incr(fmt.Sprintf("ip_requests:%s", ip)).Err()
-	if err != nil {
-		log.Printf("Error incrementing request count for IP %s: %v", ip, err)
-		return false
+		if len(requestTimestamps[ipAddress]["timestamps"].([]time.Time)) < limit {
+			requestTimestamps[ipAddress]["timestamps"] = append(timestamps, currentTime)
+			return false
+		}
 	}
-
-	// Set the expiration time for the request count
-	err = rl.redisClient.Expire(fmt.Sprintf("ip_requests:%s", ip), rateLimitTTL).Err()
-	if err != nil {
-		log.Printf("Error setting expiration for request count for IP %s: %v", ip, err)
-		return false
-	}
-
 	return true
 }
 
-func (rl *rateLimiter) updateRateLimit(ip string, newRateLimit int) error {
-	rl.Lock()
-	defer rl.Unlock()
+func getLimitAndWindow(ipAddress string) (int, int) {
+	limit, ok := requestTimestamps[ipAddress]["limit"].(int)
+	if !ok {
+		limit = defaultLimit
+	}
 
-	// Update the rate limit for the IP address
-	rl.rateLimit[ip] = newRateLimit
-	log.Printf("Rate limit updated to %d for IP %s", newRateLimit, ip)
+	window, ok := requestTimestamps[ipAddress]["window"].(int)
+	if !ok {
+		window = defaultWindow
+	}
 
-	return nil
+	return limit, window
 }
 
-func handleDataRequest(rl *rateLimiter, w http.ResponseWriter, r *http.Request) {
-	ip := r.RemoteAddr
+func getResource(c *gin.Context) {
+	clientIP := c.ClientIP()
+	limit, window := getLimitAndWindow(clientIP)
 
-	// Check if the request exceeds the rate limit
-	if !rl.checkAndConsumeRequest(ip) {
-		http.Error(w, "Too many requests from your IP address. Please try again later.", http.StatusTooManyRequests)
-		return
-	}
-
-	// Process the data request and return the response
-	fmt.Fprintf(w, "Data response for IP address: %s", ip)
-
-	// Send a log entry to Loki
-	entry := simpleclient.Entry{
-		Labels:    "app=rate-limiter",
-		Line:      fmt.Sprintf("Data request processed for IP %s", ip),
-		Timestamp: time.Now(),
-	}
-
-	err := rl.lokiClient.Push(entry)
-	if err != nil {
-		log.Printf("Error sending log entry to Loki: %v", err)
+	if !isRateLimited(clientIP, limit, window) {
+		c.JSON(http.StatusOK, gin.H{"data": "This is a rate-limited resource."})
+	} else {
+		log.Println("You have reached a limit")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded."})
 	}
 }
 
-func handleRateLimitRequest(rl *rateLimiter, w http.ResponseWriter, r *http.Request) {
-	ip := r.RemoteAddr
-	newRateLimit := r.URL.Query().Get("rate_limit")
+func changeLimit(c *gin.Context) {
+	clientIP := c.ClientIP()
+	newLimit := c.PostForm("limit")
+	newWindow := c.PostForm("window")
 
-	// Convert newRateLimit to integer
-	newRateLimitInt, err := strconv.Atoi(newRateLimit)
-	if err != nil {
-		http.Error(w, "Invalid rate limit value", http.StatusBadRequest)
-		return
+	if _, ok := requestTimestamps[clientIP]; !ok {
+		requestTimestamps[clientIP] = make(map[string]interface{})
+		requestTimestamps[clientIP]["timestamps"] = []time.Time{}
 	}
 
-	// Update the rate limit for the IP address
-	err = rl.updateRateLimit(ip, newRateLimitInt)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if newLimit != "" && newWindow != "" {
+		requestTimestamps[clientIP]["limit"] = newLimit
+		requestTimestamps[clientIP]["window"] = newWindow
+		requestTimestamps[clientIP]["timestamps"] = []time.Time{}
+		c.JSON(http.StatusOK, gin.H{"data": "Rate limit has been changed."})
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body."})
 	}
-
-	fmt.Fprintf(w, "Rate limit update to %d for IP %s", newRateLimitInt, ip)
 }
 
 func main() {
-	// Initialize Redis client
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	router := gin.Default()
 
-	// Initialize Loki client
-	lokiClient, err := simpleclient.New(lokiURL, "rate-limiter")
-	if err != nil {
-		log.Fatal("Error initializing Loki client:", err)
-	}
+	router.GET("/api/resource", getResource)
+	router.POST("/api/limit", changeLimit)
 
-	// Create rate limiter
-	rateLimiter := newRateLimiter(redisClient, lokiClient)
-
-	// Define HTTP routes
-	http.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
-
-		handleDataRequest(rateLimiter, w, r)
-
-	})
-
-	http.HandleFunc("/data/rate_limit", func(w http.ResponseWriter, r *http.Request) {
-		handleRateLimitRequest(rateLimiter, w, r)
-	})
-
-	// Start the HTTP server
-	fmt.Println("Starting HTTP server on port 8080")
-	err = http.ListenAndServe(":8080", nil)
-	if err != nil {
-		panic(err)
+	if err := router.Run(":5000"); err != nil {
+		fmt.Println(err)
 	}
 }
